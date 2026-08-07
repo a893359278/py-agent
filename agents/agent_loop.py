@@ -108,6 +108,10 @@ def run_glob(pattern: str) -> str:
         return f"Error: {e}"
     pass
 
+TOOL_HANDLERS = {
+    "bash": run_bash, "read_file": run_read, "write_file": run_write,
+    "edit_file": run_edit, "glob": run_glob,
+}
 
 def agent_loop(messages: list) -> str:
     while True:
@@ -124,9 +128,11 @@ def agent_loop(messages: list) -> str:
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(block.input["command"])
-                print(output[:200])
+                tool_name = block.name
+                handler = TOOL_HANDLERS.get(tool_name)
+                print(f"{tool_name}: {block.input}")
+                output = handler(**block.input) if handler else f"Unknown: {block.name}"
+                print(str(output)[:200])
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
