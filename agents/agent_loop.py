@@ -42,6 +42,57 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
 ]
 
+
+deny_commands = [
+    "rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"
+]
+
+
+PERMISSION_RULES = [
+    {"tools": ["read_file", "write_file", "edit_file"],
+     "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
+     "message": "Writing outside workspace"},
+    {"tools": ["bash"],
+     "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
+     "message": "Potentially destructive command"},
+]
+
+
+def check_rules(tool_name: str, args: dict) -> str | None:
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"] and rule["check"](args):
+            return rule["message"]
+    return None
+
+
+def check_deny_command(command: str) -> str | None:
+    for pattern in deny_commands:
+        if pattern in command:
+            return f"Blocked: '{pattern}' is on the deny list"
+    return None
+
+
+def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    print(f"\n\033[33m⚠  {reason}\033[0m")
+    print(f"   Tool: {tool_name}({args})")
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+
+
+def check_permission(block) -> str | None:
+    if block.name == "bash":
+        reason = check_deny_command(block.input.get("command", ""))
+        if reason:
+            print(f"\n\033[31m⛔ {reason}\033[0m")
+            return False
+    reason = check_rules(block.name, block.input)
+    if reason:
+        decision = ask_user(block.name, block.input, reason)
+        if decision == "deny":
+            return False
+    return True
+
+
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -128,6 +179,12 @@ def agent_loop(messages: list) -> str:
         results = []
         for block in response.content:
             if block.type == "tool_use":
+
+                if not check_permission(block):
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": "Permission denied."})
+                    continue
+
                 tool_name = block.name
                 handler = TOOL_HANDLERS.get(tool_name)
                 print(f"{tool_name}: {block.input}")
