@@ -1,7 +1,6 @@
 from anthropic import Anthropic
 from dotenv import load_dotenv
-import os
-import subprocess
+import ast, os, json, subprocess
 from pathlib import Path
 import glob as g
 
@@ -29,6 +28,42 @@ WORKDIR = Path.cwd()
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
+
+def _normalize_todos(todos):
+    if isinstance(todos, str):
+        try:
+            todos = json.loads(todos)
+        except json.JSONDecodeError:
+            try:
+                todos = ast.literal_eval(todos)
+            except (SyntaxError, ValueError):
+                return None, "Error: todos must be a list or JSON array string"
+    if not isinstance(todos, list):
+        return None, "Error: todos must be a list"
+    for i, t in enumerate(todos):
+        if not isinstance(t, dict):
+            return None, f"Error: todos[{i}] must be an object"
+        if "content" not in t or "status" not in t:
+            return None, f"Error: todos[{i}] missing 'content' or 'status'"
+        if t["status"] not in ("pending", "in_progress", "completed"):
+            return None, f"Error: todos[{i}] has invalid status '{t['status']}'"
+    return todos, None
+
+
+def run_todo_write(todos: list) -> str:
+    global CURRENT_TODOS
+    todos, error = _normalize_todos(todos)
+    if error:
+        return error
+    CURRENT_TODOS = todos
+    lines = ["\n\033[33m## Current Tasks\033[0m"]
+    for t in CURRENT_TODOS:
+        icon = {"pending": " ", "in_progress": "\033[36m▸\033[0m", "completed": "\033[32m✓\033[0m"}[t["status"]]
+        lines.append(f"  [{icon}] {t['content']}")
+    print("\n".join(lines))
+    return f"Updated {len(CURRENT_TODOS)} tasks"
+
+
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -40,6 +75,8 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
+     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
 ]
 
 
@@ -211,7 +248,13 @@ register_hook("Stop", summary_hook)
 
 
 def agent_loop(messages: list) -> str:
+    rounds_since_todo = 0
     while True:
+        if rounds_since_todo >= 3 and messages:
+            messages.append({"role": "user",
+                             "content": "<reminder>Update your todos.</reminder>"})
+            rounds_since_todo = 0
+
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=1024,
@@ -227,6 +270,7 @@ def agent_loop(messages: list) -> str:
             return
 
 
+        rounds_since_todo += 1
         results = []
         for block in response.content:
             if block.type != "tool_use":
@@ -243,6 +287,9 @@ def agent_loop(messages: list) -> str:
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
 
             trigger_hooks("PostToolUse", block, output)  # s04: post hook
+
+            if block.name == "todo_write":
+                rounds_since_todo = 0
 
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
 
