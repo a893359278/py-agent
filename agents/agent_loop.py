@@ -28,6 +28,12 @@ WORKDIR = Path.cwd()
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
+SUB_SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Complete the task you were given, then return a concise summary. "
+    "Do not delegate further."
+)
+
 
 def _normalize_todos(todos):
     if isinstance(todos, str):
@@ -64,7 +70,7 @@ def run_todo_write(todos: list) -> str:
     return f"Updated {len(CURRENT_TODOS)} tasks"
 
 
-TOOLS = [
+SUB_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
@@ -78,6 +84,14 @@ TOOLS = [
     {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
      "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
 ]
+
+
+TOOLS = list(SUB_TOOLS)
+TOOLS.append({
+    "name": "task",
+    "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+    "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
+})
 
 
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
@@ -207,10 +221,67 @@ def run_glob(pattern: str) -> str:
     pass
 
 
-TOOL_HANDLERS = {
+SUB_TOOLS_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,
+    "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write
 }
+
+
+def extract_text(content) -> str:
+    """Extract text from message content blocks."""
+    if not isinstance(content, list):
+        return str(content)
+    return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
+
+
+
+def spawn_subagent(description: str) -> str:
+    """Spawn a subagent with fresh messages[], return summary only."""
+    print(f"\n\033[35m[Subagent spawned]\033[0m")
+    messages = [{"role": "user", "content": description}]  # fresh context
+
+    for _ in range(30):  # safety limit
+        response = client.messages.create(
+            model=MODEL, system=SUB_SYSTEM,
+            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                # Issue 1: subagent also runs hooks (permissions apply)
+                blocked = trigger_hooks("PreToolUse", block)
+                if blocked:
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": str(blocked)})
+                    continue
+                handler = SUB_TOOLS_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown: {block.name}"
+                trigger_hooks("PostToolUse", block, output)
+                print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": output})
+        messages.append({"role": "user", "content": results})
+
+    # Issue 5: fallback if safety limit hit during tool_use
+    result = extract_text(messages[-1]["content"])
+    if not result:
+        # last message is tool_result, look backwards for assistant text
+        for msg in reversed(messages):
+            if msg["role"] == "assistant":
+                result = extract_text(msg["content"])
+                if result:
+                    break
+        if not result:
+            result = "Subagent stopped after 30 turns without final answer."
+    print(f"\033[35m[Subagent done]\033[0m")
+    return result  # only summary, entire message history discarded
+
+
+TOOL_HANDLERS = dict(SUB_TOOLS_HANDLERS)
+TOOL_HANDLERS["task"] = spawn_subagent
 
 
 def log_hook(block):
