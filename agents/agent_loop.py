@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 import ast, os, json, subprocess
 from pathlib import Path
 import glob as g
+import yaml
 
 
 load_dotenv(override=True)
@@ -25,8 +26,58 @@ client = Anthropic(
 MODEL = os.getenv("MODEL_ID")
 
 WORKDIR = Path.cwd()
+SKILLS_DIR = WORKDIR / "skills"
 
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
+SKILL_REGISTRY: dict[str, dict] = {}
+
+def parse_yaml(text: str) -> tuple[dict, str]:
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    try:
+        meta = yaml.safe_load(parts[1])
+    except yaml.YAMLError:
+        meta = {}
+    return meta, parts[2].strip()
+
+
+def load_skills(path: Path):
+    for d in sorted(path.iterdir()):
+        if not d.is_dir():
+            continue
+        manifest = d / "SKILL.md"
+        if not manifest.exists():
+            continue
+        raw = manifest.read_text()
+        meta, content = parse_yaml(raw)
+        name = meta.get("name", d.name)
+        desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
+        SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": raw}
+
+
+load_skills(SKILLS_DIR)
+
+
+def list_skills() -> str:
+    """List all skills (name + one-line description)."""
+    if not SKILL_REGISTRY:
+        return "(no skills found)"
+    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
+
+
+def build_system() -> str:
+    """Build SYSTEM prompt with skill catalog injected at startup."""
+    catalog = list_skills()
+    return (
+        f"You are a coding agent at {WORKDIR}. "
+        f"Skills available:\n{catalog}\n"
+        "Use load_skill to get full details when needed."
+    )
+
+
+SYSTEM = build_system()
 
 SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
@@ -87,11 +138,20 @@ SUB_TOOLS = [
 
 
 TOOLS = list(SUB_TOOLS)
-TOOLS.append({
-    "name": "task",
-    "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
-    "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
-})
+TOOLS.append(
+    {
+        "name": "task",
+        "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+        "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
+    }
+)
+TOOLS.append(
+    {
+        "name": "load_skill",
+        "description": "Load the full content of a skill by name.",
+        "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+    }
+)
 
 
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
@@ -221,6 +281,15 @@ def run_glob(pattern: str) -> str:
     pass
 
 
+def load_skill(name: str) -> str:
+    """Load full skill content. Lookup via registry — no path traversal."""
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        return f"Skill not found: {name}"
+    return skill["content"]
+
+
+
 SUB_TOOLS_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write
@@ -282,6 +351,7 @@ def spawn_subagent(description: str) -> str:
 
 TOOL_HANDLERS = dict(SUB_TOOLS_HANDLERS)
 TOOL_HANDLERS["task"] = spawn_subagent
+TOOL_HANDLERS["load_skill"] = load_skill
 
 
 def log_hook(block):
