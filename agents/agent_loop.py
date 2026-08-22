@@ -1,6 +1,6 @@
 from anthropic import Anthropic
 from dotenv import load_dotenv
-import ast, os, json, subprocess
+import ast, os, json, subprocess, time
 from pathlib import Path
 import glob as g
 import yaml
@@ -27,8 +27,10 @@ MODEL = os.getenv("MODEL_ID")
 
 WORKDIR = Path.cwd()
 SKILLS_DIR = WORKDIR / "skills"
-
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 SKILL_REGISTRY: dict[str, dict] = {}
+CURRENT_TODOS: list[dict] = []
 
 def parse_yaml(text: str) -> tuple[dict, str]:
     if not text.startswith("---"):
@@ -151,6 +153,10 @@ TOOLS.append(
         "description": "Load the full content of a skill by name.",
         "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
     }
+)
+TOOLS.append(
+    {"name": "compact", "description": "Summarize earlier conversation to free context space.",
+     "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}}
 )
 
 
@@ -348,10 +354,143 @@ def spawn_subagent(description: str) -> str:
     print(f"\033[35m[Subagent done]\033[0m")
     return result  # only summary, entire message history discarded
 
-
 TOOL_HANDLERS = dict(SUB_TOOLS_HANDLERS)
 TOOL_HANDLERS["task"] = spawn_subagent
 TOOL_HANDLERS["load_skill"] = load_skill
+
+
+CONTEXT_LIMIT = 50000
+KEEP_RECENT = 3
+PERSIST_THRESHOLD = 30000
+
+
+def estimate_size(msg) -> int:
+    return len(str(msg))
+
+
+def _block_typ(block):
+    return block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+
+
+def _message_has_tool_use(msg: dict) -> bool:
+    if msg.get("role") != 'assistant':
+        return False
+    content = msg.get('content')
+    if not isinstance(content, list):
+        return False
+    return any(_block_typ(block) == 'tool_use' for block in content)
+
+
+def _is_tool_result_message(msg: dict) -> bool:
+    if msg.get("role") != 'user':
+        return False
+    content = msg.get('content')
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(block, dict) and block.get('type') == 'tool_result' for block in content)
+
+
+def snip_compact(messages, max_messages=50):
+    if len(messages) <= max_messages:
+        return messages
+    keep_head, keep_tail = 3, max_messages - 3
+    head_end, tail_start = keep_head, len(messages) - keep_tail
+    if head_end > 0 and _message_has_tool_use(messages[head_end - 1]):
+        while head_end < len(messages) and _is_tool_result_message(messages[head_end]):
+            head_end += 1
+    if (tail_start > 0 and tail_start< len(messages)
+            and _is_tool_result_message(messages[tail_start])
+        and _message_has_tool_use(messages[tail_start] - 1)):
+        tail_start -= 1
+    if head_end >= tail_start:
+        return messages
+    snipped = tail_start - head_end
+    return messages[:head_end] + [{"role": "user", "content": f"[snipped {snipped} messages]"}] + messages[tail_start:]
+
+
+def collect_tool_results(messages: list) -> list:
+    blocks = []
+    for mi, msg in enumerate(messages):
+        if msg.get('role') != 'user' or not isinstance(msg.get('content'), list): continue
+        for bi, block in enumerate(msg['content']):
+            if isinstance(block, dict) and block.get('type') == 'tool_result':
+                blocks.append((mi, bi, block))
+    return blocks
+
+
+def micro_compact(messages):
+    tool_results = collect_tool_results(messages)
+    if len(tool_results) <= KEEP_RECENT:
+        return messages
+    for _, _, block in tool_results[:-KEEP_RECENT]:
+        if len(block.get('content', '')) > 120:
+            block["content"] = "[Earlier tool result compacted. Re-run if needed.]"
+    return messages
+
+
+def persist_large_output(tool_use_id, output):
+    if len(output) <= PERSIST_THRESHOLD: return output
+    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
+    if not path.exists(): path.write_text(output)
+    return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
+
+
+def tool_result_budget(messages, max_bytes=200_000):
+    last = messages[-1] if messages else None
+    if not last or last['role'] != 'user' or not isinstance(last.get('content'), list):
+        return messages
+    blocks = [(i, b) for i, b in enumerate(last['content']) if isinstance(b, dict) and b.get('type') == 'tool_result']
+    total = sum(len(str(b.get('content', ''))) for _, b in blocks)
+    if total <= max_bytes: return messages
+    ranked = sorted(blocks, key=lambda p: len(str(p[1].get('content', ''))), reverse=True)
+    for _, block in ranked:
+        if total <= max_bytes: break
+        content = str(block.get("content", ""))
+        if len(content) <= PERSIST_THRESHOLD: continue
+        tid = block.get("tool_use_id", "unknown")
+        block["content"] = persist_large_output(tid, content)
+        total = sum(len(str(b.get("content", ""))) for _, b in blocks)
+    return messages
+
+
+def write_transcript(messages):
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    path = TOOL_RESULTS_DIR / f"transcript_{int(time.time())}.jsonl"
+    with path.open("w") as f:
+        for msg in messages: f.write(json.dumps(msg, default=str) + "\n")
+    return path
+
+
+def summarize_history(messages):
+    conversation = json.dumps(messages, default=str)[:80000]
+    prompt = ("Summarize this coding-agent conversation so work can continue.\n"
+              "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
+              "4. remaining work, 5. user constraints.\nBe compact but concrete.\n\n" + conversation)
+    response = client.messages.create(model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=2000)
+    return "\n".join(
+        getattr(block, "text", "")
+        for block in response.content
+        if getattr(block, "type", None) == "text").strip() or "(empty summary)"
+
+
+def compact_history(messages):
+    transcript_path = write_transcript(messages)
+    print(f"[transcript saved: {transcript_path}]")
+    summary = summarize_history(messages)
+    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
+
+
+# Emergency: reactiveCompact — on API error
+def reactive_compact(messages):
+    transcript = write_transcript(messages)
+    tail_start = max(0, len(messages) - 5)
+    if (tail_start > 0 and tail_start < len(messages)
+            and _is_tool_result_message(messages[tail_start])
+            and _message_has_tool_use(messages[tail_start - 1])):
+        tail_start -= 1
+    summary = summarize_history(messages[:tail_start])
+    return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"}, *messages[tail_start:]]
 
 
 def log_hook(block):
@@ -387,55 +526,64 @@ register_hook("PreToolUse", log_hook)
 register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
+MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
 
-def agent_loop(messages: list) -> str:
-    rounds_since_todo = 0
+
+def agent_loop(messages: list):
+    reactive_retries = 0
     while True:
-        if rounds_since_todo >= 3 and messages:
-            messages.append({"role": "user",
-                             "content": "<reminder>Update your todos.</reminder>"})
-            rounds_since_todo = 0
+        # s08 change: three preprocessors (0 API calls, cheap first)
+        # Order matches CC source: budget → snip → micro
+        messages[:] = tool_result_budget(messages)    # L3: persist large results first
+        messages[:] = snip_compact(messages)          # L1: trim middle
+        messages[:] = micro_compact(messages)         # L2: old result placeholders
 
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=1024,
-        )
+        # s08 change: tokens still over threshold → LLM summary (1 API call)
+        if estimate_size(messages) > CONTEXT_LIMIT:
+            print("[auto compact]")
+            messages[:] = compact_history(messages)
+
+        try:
+            response = client.messages.create(model=MODEL, system=SYSTEM, messages=messages, tools=TOOLS, max_tokens=8000)
+            reactive_retries = 0  # reset on successful API call
+        except Exception as e:
+            if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
+                print("[reactive compact]")
+                messages[:] = reactive_compact(messages)
+                reactive_retries += 1
+                continue
+            raise
 
         messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use": return
 
-        if response.stop_reason != "tool_use":
-            force = trigger_hooks("Stop", messages)
-            if force:
-                messages.append({"role": "user", "content": force})
-                continue
-            return
-
-
-        rounds_since_todo += 1
         results = []
         for block in response.content:
-            if block.type != "tool_use":
-                continue
+            if block.type != "tool_use": continue
+            print(f"\033[36m> {block.name}\033[0m")
 
-            # s04 change: hook replaces hard-coded check_permission()
+            if block.name == "compact":
+                messages[:] = compact_history(messages)
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": "[Compacted. Conversation history has been summarized.]"})
+                messages.append({"role": "user", "content": results})
+                break  # end current turn, start fresh with compacted context
+
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": str(blocked)})
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(blocked)})
                 continue
-
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
-
-            trigger_hooks("PostToolUse", block, output)  # s04: post hook
-
-            if block.name == "todo_write":
-                rounds_since_todo = 0
-
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-
-        messages.append({"role": "user", "content": results})
-
+            trigger_hooks("PostToolUse", block, output)
+            print(str(output)[:200])
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        else:
+            # normal path: no compact was called
+            messages.append({"role": "user", "content": results})
+            continue
+        # compact was called: results already appended above
+        continue
 
 if __name__ == '__main__':
     print("Agent Loop")
